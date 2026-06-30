@@ -1,0 +1,6 @@
+{
+  "material_price_per_kg": 25.0,
+  "machine_rate_per_hour": 0.5,
+  "waste_failure_buffer_percent": 12.0,
+  "profit_margin_percent": 25.0
+}
