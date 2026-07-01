@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 
@@ -17,16 +18,22 @@ DEFAULT_SETTINGS = {
 
 
 def load_settings():
+    merged = dict(DEFAULT_SETTINGS)
     if os.path.exists(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, "r") as f:
                 data = json.load(f)
-            merged = dict(DEFAULT_SETTINGS)
-            merged.update(data)
-            return merged
         except (json.JSONDecodeError, OSError):
-            return dict(DEFAULT_SETTINGS)
-    return dict(DEFAULT_SETTINGS)
+            data = {}
+        for key in DEFAULT_SETTINGS:
+            if key in data:
+                try:
+                    value = float(data[key])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(value) and value >= 0:
+                    merged[key] = value
+    return merged
 
 
 def save_settings(settings):
@@ -72,10 +79,15 @@ def parse_gcode_metadata(text):
     result = {"grams": None, "hours": None, "filament_name": None}
 
     comment_lines = [line.strip() for line in text.splitlines() if line.strip().startswith(";")]
+    seen_weight_lines = set()
 
     total_weight = None
     weight_sum = 0.0
     weight_found = False
+
+    hours_normal = None
+    hours_silent = None
+    hours_generic = None
 
     for line in comment_lines:
         lower = line.lower()
@@ -86,27 +98,41 @@ def parse_gcode_metadata(text):
                 total_weight = float(m.group(1))
 
         elif re.search(r"filament\s+(?:weight|used)\s*\[?g\]?\s*[:=]", lower):
-            m = re.search(r"filament\s+(?:weight|used)\s*\[?g\]?\s*[:=]\s*([\d.,\s]+)", lower)
-            if m:
-                nums = re.findall(r"[\d.]+", m.group(1))
-                for n in nums:
-                    try:
-                        weight_sum += float(n)
-                        weight_found = True
-                    except ValueError:
-                        pass
+            if lower not in seen_weight_lines:
+                seen_weight_lines.add(lower)
+                m = re.search(r"filament\s+(?:weight|used)\s*\[?g\]?\s*[:=]\s*([\d.,\s]+)", lower)
+                if m:
+                    nums = re.findall(r"[\d.]+", m.group(1))
+                    for n in nums:
+                        try:
+                            weight_sum += float(n)
+                            weight_found = True
+                        except ValueError:
+                            pass
 
         if "estimated printing time" in lower or "model printing time" in lower:
             m = re.search(r"(?:estimated printing time|model printing time).*?[:=]\s*(.+)", lower)
             if m:
                 t = parse_time_to_hours(m.group(1))
                 if t is not None:
-                    result["hours"] = t
+                    if "silent mode" in lower:
+                        hours_silent = hours_silent if hours_silent is not None else t
+                    elif "normal mode" in lower:
+                        hours_normal = hours_normal if hours_normal is not None else t
+                    else:
+                        hours_generic = hours_generic if hours_generic is not None else t
 
         if result["filament_name"] is None:
             m = re.search(r";\s*(?:filament_type|plate name)\s*[:=]\s*(.+)", line, re.IGNORECASE)
             if m:
                 result["filament_name"] = m.group(1).strip()
+
+    if hours_normal is not None:
+        result["hours"] = hours_normal
+    elif hours_generic is not None:
+        result["hours"] = hours_generic
+    elif hours_silent is not None:
+        result["hours"] = hours_silent
 
     if total_weight is not None:
         result["grams"] = round(total_weight, 2)
@@ -133,9 +159,12 @@ def update_settings():
     for key in DEFAULT_SETTINGS:
         if key in data:
             try:
-                settings[key] = float(data[key])
+                value = float(data[key])
             except (TypeError, ValueError):
                 return jsonify({"error": f"Invalid value for {key}"}), 400
+            if not math.isfinite(value) or value < 0:
+                return jsonify({"error": f"{key} must be a non-negative number"}), 400
+            settings[key] = value
     save_settings(settings)
     return jsonify(settings)
 
@@ -158,13 +187,14 @@ def parse_gcode():
     parsed = parse_gcode_metadata(text)
 
     if parsed["grams"] is None and parsed["hours"] is None:
-        return jsonify({
-            "error": "Could not find filament weight or print time in this gcode file. "
-                     "Please enter values manually.",
-            "grams": None,
-            "hours": None,
-            "filament_name": None,
-        }), 200
+        parsed["error"] = (
+            "Could not find filament weight or print time in this gcode file. "
+            "Please enter values manually."
+        )
+    elif parsed["grams"] is None:
+        parsed["error"] = "Could not find filament weight in this gcode file. Please enter it manually."
+    elif parsed["hours"] is None:
+        parsed["error"] = "Could not find print time in this gcode file. Please enter it manually."
 
     return jsonify(parsed)
 
@@ -471,12 +501,17 @@ function fmt(n) {
 }
 
 async function loadSettings() {
-  const res = await fetch('/api/settings');
-  const data = await res.json();
-  materialPrice.value = data.material_price_per_kg;
-  machineRate.value = data.machine_rate_per_hour;
-  bufferPercent.value = data.waste_failure_buffer_percent;
-  profitPercent.value = data.profit_margin_percent;
+  try {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    materialPrice.value = data.material_price_per_kg;
+    machineRate.value = data.machine_rate_per_hour;
+    bufferPercent.value = data.waste_failure_buffer_percent;
+    profitPercent.value = data.profit_margin_percent;
+  } catch (err) {
+    parseError.textContent = 'Could not load settings from the server.';
+    parseError.classList.remove('hidden');
+  }
 }
 loadSettings();
 
@@ -487,14 +522,23 @@ saveSettingsBtn.addEventListener('click', async () => {
     waste_failure_buffer_percent: bufferPercent.value,
     profit_margin_percent: profitPercent.value,
   };
-  const res = await fetch('/api/settings', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload),
-  });
-  if (res.ok) {
-    saveMsg.classList.remove('hidden');
-    setTimeout(() => saveMsg.classList.add('hidden'), 2000);
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      saveMsg.classList.remove('hidden');
+      setTimeout(() => saveMsg.classList.add('hidden'), 2000);
+    } else {
+      parseError.textContent = data.error || 'Could not save settings.';
+      parseError.classList.remove('hidden');
+    }
+  } catch (err) {
+    parseError.textContent = 'Could not save settings — the server returned an unexpected response.';
+    parseError.classList.remove('hidden');
   }
 });
 
@@ -522,8 +566,18 @@ async function handleFile(file) {
   const formData = new FormData();
   formData.append('file', file);
 
-  const res = await fetch('/api/parse-gcode', { method: 'POST', body: formData });
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/api/parse-gcode', { method: 'POST', body: formData });
+    data = await res.json();
+  } catch (err) {
+    parseError.textContent = 'Could not reach the server to parse this file. Please enter values manually.';
+    parseError.classList.remove('hidden');
+    manualGrams.value = '';
+    manualHours.value = '';
+    manualEntry.classList.add('visible');
+    return;
+  }
 
   if (data.error) {
     parseError.textContent = data.error;
@@ -546,12 +600,19 @@ calcBtn.addEventListener('click', async () => {
   }
   parseError.classList.add('hidden');
 
-  const res = await fetch('/api/calculate', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ grams, hours }),
-  });
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/api/calculate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ grams, hours }),
+    });
+    data = await res.json();
+  } catch (err) {
+    parseError.textContent = 'Could not reach the server to calculate a price. Please try again.';
+    parseError.classList.remove('hidden');
+    return;
+  }
 
   if (data.error) {
     parseError.textContent = data.error;
